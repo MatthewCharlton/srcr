@@ -1,5 +1,5 @@
 import React, { Component, useEffect, useState } from "react";
-import { renderToString } from "react-dom/server";
+import { renderToString as reactRenderToString } from "react-dom/server";
 
 const isNode = () =>
   Object.prototype.toString.call(
@@ -14,11 +14,30 @@ const isServer = serverCheck
   ? serverCheck()
   : isNode() || !(typeof window != "undefined" && window.document);
 
-const dataAttrName = "data-srcr";
+const SRCR_TYPE = Symbol("srcr");
+
+if (!isServer) {
+  window.onerror = function () {
+    if (arguments && arguments.length > 3 && typeof arguments[4] === "object") {
+      return arguments[4].type === SRCR_TYPE;
+    }
+  };
+}
+
+const fixSRCRComments = (htmlString) => {
+  return htmlString.replace(
+    /(<div data-srcr-comment="true">&lt;!--) ([\w\d_]+) (--&gt;<\/div>)/g,
+    "<!-- $2 -->"
+  );
+};
+
+export const renderToString = (App) => {
+  const appString = reactRenderToString(App);
+  return fixSRCRComments(appString);
+};
 
 const cache = new Map();
-
-const suspenderSet = new Set();
+const requestCache = new Map();
 
 globalThis.__srcrLoaded = true;
 
@@ -26,37 +45,30 @@ export class SrcrSuspense extends Component {
   constructor(props) {
     super(props);
     this.state = {
-      inSuspense: isServer,
+      inSuspense: false,
     };
-    suspenderSet.add(this);
-    this.suspenderIdx = suspenderSet.size - 1;
+
+    if (!cache.get(this) && isServer) {
+      cache.set(this);
+      this.suspenderIdx = cache.size - 1;
+    }
   }
 
   componentDidCatch(err) {
-    if (!err.key) throw err;
+    if (!err.key && err.type !== SRCR_TYPE) throw err;
 
-    const { key } = err;
-
-    const { toResolve, resolvedResponse } = cache.get(key);
-
-    if (resolvedResponse) {
-      this.setState({ inSuspense: false });
-      return this.props.children;
-    }
-
-    this.setState({ inSuspense: true });
+    const { key, toResolve } = err;
 
     const suspender = toResolve;
     this._suspender = suspender;
 
+    this.setState({ inSuspense: true });
+
     const update = (res) => {
       if (this._suspender !== suspender) return;
 
-      cache.set(key, {
-        ...cache.get(key),
-        resolvedResponse: res,
-        toResolve: null,
-      });
+      globalThis[`srcr-comp-json_${key}`] = res;
+
       this.setState({ inSuspense: false });
     };
 
@@ -91,43 +103,56 @@ const Comment = ({ start, text }) => {
 };
 
 export const useSuspensfulSRCR = (requestPromise, key) => {
-  if (!cache.get(key)) {
-    const suspenseBoundary = Array.from(suspenderSet)[suspenderSet.size - 1];
-    cache.set(key, {
-      ...cache.get(key),
-      suspenseBoundary,
-      suspenseBoundaryIdx: suspenseBoundary.suspenderIdx,
-      toResolve: null,
-      resolvedResponse: null,
-    });
+  let toResolve;
+  if (!requestCache.get(key) && isServer) {
+    const req = requestPromise();
+    requestCache.set(key, req);
+    toResolve = req;
+  } else {
+    toResolve = requestCache.get(key);
   }
-
+  if (cache.size > 0 && isServer) {
+    const suspenseBoundary = Array.from(cache)[cache.size - 1][0];
+    if (!cache.get(suspenseBoundary)) {
+      cache.set(suspenseBoundary, {
+        ...cache.get(suspenseBoundary),
+        [key]: {
+          ...(cache.get(suspenseBoundary) && cache.get(suspenseBoundary)[key]),
+          toResolve,
+        },
+      });
+    }
+  }
   return {
     read: () => {
       const resolvedDataOnClient = globalThis[`srcr-comp-json_${key}`];
+
       if (resolvedDataOnClient) {
         return resolvedDataOnClient;
       }
 
-      const { resolvedResponse, toResolve } = cache.get(key);
-      if (resolvedResponse) {
-        return resolvedResponse;
+      if (cache.size > 0 && isServer) {
+        const suspenseBoundary = Array.from(cache)[cache.size - 1][0];
+        cache.set(suspenseBoundary, {
+          ...cache.get(suspenseBoundary),
+          [key]: {
+            ...(cache.get(suspenseBoundary) &&
+              cache.get(suspenseBoundary)[key]),
+            toResolve,
+          },
+        });
       }
-
-      if (toResolve) {
-        if (!isServer) throw { key };
-        return;
+      if (!isServer) {
+        let toResolve;
+        if (!requestCache.get(key)) {
+          const req = requestPromise();
+          requestCache.set(key, req);
+          toResolve = req;
+        } else {
+          toResolve = requestCache.get(key);
+        }
+        throw { key, type: SRCR_TYPE, toResolve };
       }
-
-      const suspenseBoundary = Array.from(suspenderSet)[suspenderSet.size - 1];
-      cache.set(key, {
-        ...cache.get(key),
-        suspenseBoundary,
-        suspenseBoundaryIdx: suspenseBoundary.suspenderIdx,
-        toResolve: requestPromise(),
-      });
-
-      if (!isServer) throw { key };
     },
   };
 };
@@ -142,16 +167,15 @@ const resolveDataOrPromise = async (key, requestPromise) => {
 
 export const useSRCR = (requestPromise, key) => {
   const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
 
-  if (!cache.get(key)) {
-    cache.set(key, {
-      requestPromise,
-    });
+  if (!cache.get(key) && isServer) {
+    cache.set(key, requestPromise);
   }
 
   useEffect(() => {
     if (isServer) return;
+    setLoading(true);
     async function fetchData() {
       const json = await resolveDataOrPromise(key, requestPromise);
       setData(json);
@@ -163,40 +187,19 @@ export const useSRCR = (requestPromise, key) => {
   return { data, loading };
 };
 
-export const fixSRCRComments = (htmlString) => {
-  return htmlString.replace(
-    /(<div data-srcr-comment="true">&lt;!--) ([\w\d_]+) (--&gt;<\/div>)/g,
-    "<!-- $2 -->"
-  );
-};
-
-const copyElsIntoPlace = (key, idx, dataAttrName) => {
-  // data already loaded which means React has already hydrated
-  if (globalThis[`srcr-comp-json_${key}`] || globalThis.__srcrLoaded) return;
-  const rootEls = document.querySelectorAll(
-    "[data-reactroot]:not([data-srcr-post])"
-  );
+const copyElsIntoPlace = (idx, suffix = "") => {
+  const rootEls = document.querySelectorAll("[data-reactroot]");
   rootEls.forEach((rootEl) => {
+    // data already loaded which means React has already hydrated
+    if (globalThis.__srcrLoaded) return;
     const start = rootEl.innerHTML.match(`(<!--) (srcr_s_${idx}) (-->)`);
     const end = rootEl.innerHTML.match(`(<!--) (srcr_e_${idx}) (-->)`);
-    const postEl = document.querySelector(`[${dataAttrName}-post="${key}"]`);
+    const postEl = document.querySelector(
+      `[data-srcr-suspender="${idx}${suffix}"]`
+    );
     if (!start || !end || !postEl) return;
-
-    // WIP - still figuring out how we can stitch in the HTML of the nested components
-    const nestedStart = postEl.innerHTML.match(`<!-- srcr_s_([\\d]) -->`);
-    const nestedEnd = postEl.innerHTML.match(`<!-- srcr_e_([\\d]) -->`);
-    if (nestedStart && nestedEnd) {
-      console.log(nestedStart);
-      const id = nestedStart[1];
-      const nestedEl = document.querySelector(`[data-srcr-suspender="${id}"]`);
-      postEl.innerHTML =
-        postEl.innerHTML.substring(0, nestedStart.index) +
-        nestedEl.innerHTML +
-        postEl.innerHTML.substring(nestedEnd.index);
-    }
-
     rootEl.innerHTML =
-      rootEl.innerHTML.substring(0, start.index) +
+      rootEl.innerHTML.substring(0, start[0].length + start.index) +
       postEl.innerHTML +
       rootEl.innerHTML.substring(end.index);
   });
@@ -204,61 +207,80 @@ const copyElsIntoPlace = (key, idx, dataAttrName) => {
 
 export const resolvedDataToHTML = async (resWriter) => {
   const entries = Array.from(cache.entries());
+  cache.clear();
 
-  return Promise.allSettled(
-    entries.map(
-      async ([
-        key,
-        { requestPromise, toResolve, suspenseBoundary, suspenseBoundaryIdx },
-      ]) => {
-        let html = "<div hidden style='display:none'>";
+  const seenKeys = new Set();
 
-        if (requestPromise) {
-          const json = await requestPromise();
-          html += `<script>globalThis["srcr-comp-json_${key}"] = ${JSON.stringify(
-            json
-          ).replace(/</g, "\\u003C")}</script>`;
-        } else {
-          const json = await toResolve;
-
-          cache.set(key, {
-            ...cache.get(key),
-            toResolve: null,
-            resolvedResponse: json,
-          });
-
-          const post = suspenseBoundary.props.children;
-          if (post) {
-            html += fixSRCRComments(
-              renderToString(
-                <div
-                  data-srcr-post={key}
-                  data-srcr-suspender={suspenseBoundaryIdx}
-                >
-                  {post}
-                </div>
-              )
-            );
-          }
-
-          html += `<script>(${copyElsIntoPlace})("${key}", "${suspenseBoundaryIdx}", "${dataAttrName}");</script>`;
-
-          // add data to global after the component HTML stitching to ensure it doesn't move HTML after React has hydrated
-          html += `<script data-idx=${suspenseBoundaryIdx}>globalThis["srcr-comp-json_${key}"] = ${JSON.stringify(
-            json
-          ).replace(/</g, "\\u003C")}</script>`;
-        }
-        html += "</div>";
-
+  return Promise.all(
+    entries.map(async ([suspenseBoundaryOrKey, items]) => {
+      if (typeof suspenseBoundaryOrKey === "string") {
+        const key = suspenseBoundaryOrKey;
+        const req = items;
+        const json = await req();
+        globalThis[`srcr-comp-json_${key}`] = json;
+        const html = `<script>globalThis["srcr-comp-json_${key}"] = ${JSON.stringify(
+          json
+        ).replace(/</g, "\\u003C")}</script>`;
         resWriter(html);
-
-        cache.delete(key);
-        suspenderSet.clear();
-
-        return html;
+        return;
       }
-    )
+      if (!items) return;
+      const suspenseBoundary = suspenseBoundaryOrKey;
+      const suspenseBoundaryIdx = suspenseBoundary.suspenderIdx;
+      let html = `<div hidden data-idx=${suspenseBoundaryIdx}>`;
+
+      const dataArray = await Promise.all(
+        Object.keys(items).map(async (key) => {
+          const { toResolve } = items[key];
+          let req = toResolve;
+          if (!req) req = globalThis[`srcr-comp-json_${key}`];
+
+          const json = await req;
+
+          seenKeys.add(key);
+
+          return { json, key };
+        })
+      );
+
+      dataArray.map((data) => {
+        if (!data) return;
+        const { json, key } = data;
+
+        const prevData = globalThis[`srcr-comp-json_${key}`];
+
+        globalThis[`srcr-comp-json_${key}`] = json || prevData;
+
+        // add data to global after the component HTML stitching to ensure it doesn't move HTML after React has hydrated
+        html += `<script>globalThis["srcr-comp-json_${key}"] = ${JSON.stringify(
+          json || null
+        ).replace(/</g, "\\u003C")}</script>`;
+      });
+
+      const componentOutput = suspenseBoundary.props.children;
+      if (componentOutput) {
+        html += renderToString(
+          <div data-srcr-suspender={`${suspenseBoundaryIdx}`}>
+            {componentOutput}
+          </div>
+        );
+      }
+
+      html += `<script>(${copyElsIntoPlace})("${suspenseBoundaryIdx}");</script>`;
+
+      html += "</div>";
+
+      // console.log(html);
+
+      resWriter(html);
+
+      return html;
+    })
   ).finally(() => {
-    cache.clear();
+    seenKeys.forEach(
+      (key) => (globalThis[`srcr-comp-json_${key}`] = undefined)
+    );
+    seenKeys.clear();
+    requestCache.clear();
   });
 };
