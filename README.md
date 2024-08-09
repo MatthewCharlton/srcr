@@ -2,7 +2,7 @@
 ## React - Suspense only SRCR (React 16.8.6)
 
 ### What does it do?
-Server makes the fetch and inlines the JSON response and component HTML with resolved response for the client to show. This means expensive network requests can be triggered on the server ASAP with the response streamed later.
+Server makes the fetch and inlines the JSON response and component HTML with resolved response for the client to show. This means expensive network requests can be triggered on the server ASAP with the response streamed in later and rendered on the client A.K.A "Out of order streaming".
 
 Designed to imitate the behaviour of data fetching using Suspense with SSR in React 18.
 
